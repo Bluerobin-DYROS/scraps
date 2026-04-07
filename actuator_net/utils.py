@@ -21,6 +21,8 @@ from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import ParameterGrid
 import datetime
+import json
+from typing import Optional, Tuple
 
 class ActuatorDataset(Dataset):
     def __init__(self, data):
@@ -73,7 +75,7 @@ class Act(nn.Module):
 
 def build_mlp(in_dim, units, layers, out_dim, act='relu', layer_norm=False, act_final=False):
     mods = [nn.Linear(in_dim, units), Act(act)]
-    for i in range(layers-1):
+    for _ in range(layers-1):
         mods += [nn.Linear(units, units), Act(act)]
     mods += [nn.Linear(units, out_dim)]
     if act_final:
@@ -91,12 +93,14 @@ class LSTMModel(nn.Module):
         self.lstm = nn.LSTM(input_dim, hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, out_dim)
 
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        out, _ = self.lstm(x, (h0, c0))
+    def forward(self, x: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if state is None:
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+            state = (h0, c0)
+        out, (h, c) = self.lstm(x, state)
         out = self.fc(out[:, -1, :])
-        return out
+        return out, (h, c)
 
 def build_lstm(in_dim, units, layers, out_dim):
     return LSTMModel(in_dim, units, layers, out_dim)
@@ -112,8 +116,9 @@ def load_dataloaders(load_path):
     return dataloaders['train'], dataloaders['test']
 
 def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, layers, lr, epochs, eps, weight_decay,
-                           actuator_network_path, dataloader_path, model_type, save_dataloaders_flag=True,
-                           return_stats=False):
+                           actuator_network_path, dataloader_path, model_type, num_joints=1,
+                           pretrained_model_path=None, save_dataloaders_flag=True, return_stats=False,
+                           global_step_offset=0, log_dir=None):
     print(xs.shape, ys.shape)
     num_data = xs.shape[0]
     num_train = num_data // 5 * 4
@@ -127,19 +132,22 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
     if save_dataloaders_flag:
         save_dataloaders(train_loader, test_loader, dataloader_path)
     
-    if model_type == "mlp":
-        model = build_mlp(in_dim=(num_samples_in_history + 1) * 2, 
-                        units=units, layers=layers, out_dim=1, act='softsign')
+    if pretrained_model_path is not None and os.path.exists(pretrained_model_path):
+        model = torch.jit.load(pretrained_model_path)
+        print(f"Warm-start from {pretrained_model_path}")
+    elif model_type == "mlp":
+        model = build_mlp(in_dim=(num_samples_in_history + 1) * 2 * num_joints,
+                        units=units, layers=layers, out_dim=num_joints, act='softsign')
     elif model_type == "lstm":
-        model = build_lstm(1, units=units, layers=layers, out_dim=1)
+        model = build_lstm(2, units=units, layers=layers, out_dim=num_joints)
 
     opt = Adam(model.parameters(), lr=lr, eps=eps, weight_decay=weight_decay)
     device = 'cuda:0'
     model = model.to(device)
 
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%I-%M%p")
-    run_name = f"bs{batch_size}_u{units}_l{layers}_lr{lr}_eps{eps}_wd{weight_decay}_ns{num_samples_in_history}_{current_time}"
-    log_dir = f'./logs/{run_name}'
+    if log_dir is None:
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d_%I-%M%p")
+        log_dir = f'./logs/bs{batch_size}_u{units}_l{layers}_lr{lr}_eps{eps}_wd{weight_decay}_ns{num_samples_in_history}_{current_time}'
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
 
@@ -169,8 +177,10 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
         for batch in train_loader:
             data = batch['joint_states'].to(device)
             if model_type == 'lstm':
-                data = data.view(data.size(0), data.size(1), 1) 
-            y_pred = model(data)
+                # data: (batch, seq_len, 2*num_joints) – already windowed
+                y_pred, _ = model(data)
+            else:
+                y_pred = model(data)
             opt.zero_grad()
             y_label = batch['tau_ests'].to(device)
             loss = ((y_pred - y_label) ** 2).mean()
@@ -187,8 +197,9 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
             for batch in test_loader:
                 data = batch['joint_states'].to(device)
                 if model_type == 'lstm':
-                    data = data.view(data.size(0), data.size(1), 1) 
-                y_pred = model(data)
+                    y_pred, _ = model(data)
+                else:
+                    y_pred = model(data)
                 y_label = batch['tau_ests'].to(device)
                 tau_est_loss = ((y_pred - y_label) ** 2).mean()
                 loss = tau_est_loss
@@ -201,9 +212,10 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
             mae /= ct
 
         # Log losses and MAE for each epoch within the same hparam context
-        writer.add_scalar('Loss/train', epoch_loss, epoch)
-        writer.add_scalar('Loss/test', test_loss, epoch)
-        writer.add_scalar('MAE/test', mae, epoch)
+        global_step = global_step_offset + epoch
+        writer.add_scalar('Loss/train', epoch_loss, global_step)
+        writer.add_scalar('Loss/test', test_loss, global_step)
+        writer.add_scalar('MAE/test', mae, global_step)
 
         print(f'epoch: {epoch} | loss: {epoch_loss:.4f} | test loss: {test_loss:.4f} | mae: {mae:.4f}')
 
@@ -220,12 +232,33 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
     else:
         return model
 
-def load_experiments(exp_dir, 
+# 12 individual actuator groups (one network per joint, no coupling).
+# Indices refer to joint_position_errors/velocities/tau_ests columns (0-based, after platform is stripped).
+JOINT_GROUPS = [
+    ([0],  "left_hip_roll"),
+    ([1],  "left_hip_pitch"),
+    ([2],  "left_hip_yaw"),
+    ([3],  "left_knee_pitch"),
+    ([4],  "left_ankle_pitch"),
+    ([5],  "left_ankle_roll"),
+    ([6],  "right_hip_roll"),
+    ([7],  "right_hip_pitch"),
+    ([8],  "right_hip_yaw"),
+    ([9],  "right_knee_pitch"),
+    ([10], "right_ankle_pitch"),
+    ([11], "right_ankle_roll"),
+]
+
+EVAL_PKL_NAME = "data_period2.0_radius_0.03.pkl"
+
+def load_experiments(exp_dir,
                     torque_scaling=.01,
-                    torque_cliping=[-2, 2]):
+                    exclude=None):
     datas = []
 
     experiments = glob(f"{exp_dir}/*.pkl")
+    if exclude:
+        experiments = [e for e in experiments if os.path.basename(e) not in exclude]
     for experiment in experiments:
         with open(experiment, 'rb') as f:
             data = pickle.load(f)
@@ -253,13 +286,12 @@ def load_experiments(exp_dir,
 
     for i in range(len(datas)):
         # TODO: For now, we ignore platform joint. Needs to be added back
-        tau_ests[i, :] = np.clip(np.array(datas[i]["joint_efforts"][1:]) * torque_scaling, 
-                                 *torque_cliping)
+        tau_ests[i, :] = np.array(datas[i]["joint_efforts"][1:]) * torque_scaling
         joint_positions[i, :] = datas[i]["joint_positions"][1:]
         joint_position_targets[i, :] = datas[i]["joint_position_command"][1:]
         joint_velocities[i, :] = datas[i]["joint_velocities"][1:]
 
-    joint_position_errors = joint_positions - joint_position_targets
+    joint_position_errors = joint_position_targets - joint_positions
     joint_velocities = joint_velocities
 
     joint_position_errors = torch.tensor(joint_position_errors, dtype=torch.float)
@@ -268,7 +300,26 @@ def load_experiments(exp_dir,
 
     return joint_position_errors, joint_velocities, tau_ests, num_actuators
 
-def prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, num_actuators, num_samples_in_history):
+def load_single_experiment(pkl_path, torque_scaling=0.01):
+    """Load a single pkl file and return (joint_position_errors, joint_velocities, tau_ests)."""
+    with open(pkl_path, 'rb') as f:
+        datas = pickle.load(f)
+    num_actuators = len(datas[0]["joint_positions"]) - 1
+    tau_ests        = np.zeros((len(datas), num_actuators))
+    joint_positions = np.zeros((len(datas), num_actuators))
+    joint_targets   = np.zeros((len(datas), num_actuators))
+    joint_velocities= np.zeros((len(datas), num_actuators))
+    for i in range(len(datas)):
+        tau_ests[i, :]         = np.array(datas[i]["joint_efforts"][1:]) * torque_scaling
+        joint_positions[i, :]  = datas[i]["joint_positions"][1:]
+        joint_targets[i, :]    = datas[i]["joint_position_command"][1:]
+        joint_velocities[i, :] = datas[i]["joint_velocities"][1:]
+    jpe = torch.tensor(joint_targets - joint_positions, dtype=torch.float)
+    jv  = torch.tensor(joint_velocities,                dtype=torch.float)
+    te  = torch.tensor(tau_ests,                        dtype=torch.float)
+    return jpe, jv, te
+
+def prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, num_actuators, num_samples_in_history, model_type="lstm"):
     xs = []
     ys = []
     
@@ -278,9 +329,10 @@ def prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, nu
         # Create list to hold time-shifted features for current actuator
         xs_joint = []
 
-        # Append time-shifted data for each time step from num_samples_in_history-1 to 0
+        # Append all position errors first [e(t), e(t-1), ..., e(t-N)], then all velocities [v(t), v(t-1), ..., v(t-N)]
         for t in range(num_samples_in_history-1, -1, -1):
             xs_joint.append(joint_position_errors[t:-(num_samples_in_history-t) if num_samples_in_history-t != 0 else None, i:i+1])
+        for t in range(num_samples_in_history-1, -1, -1):
             xs_joint.append(joint_velocities[t:-(num_samples_in_history-t) if num_samples_in_history-t != 0 else None, i:i+1])
 
         # Concatenate all features horizontally (new feature columns)
@@ -297,117 +349,168 @@ def prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, nu
 
     return xs[::num_samples_in_history + 1], ys[::num_samples_in_history + 1]
 
+# Data is recorded at 0.001 s; history samples are spaced 0.01 s apart → stride of 10 steps.
+HISTORY_STRIDE = 10
+
+def prepare_data_for_joint_group(joint_position_errors, joint_velocities, tau_ests, joint_indices, num_samples_in_history, history_stride=HISTORY_STRIDE, model_type="lstm"):
+    """Like prepare_data_for_model but for a specific group of joints (single or coupled).
+
+    History samples are spaced `history_stride` data-steps apart (default 10 × 0.001 s = 0.01 s).
+
+    For n joints in the group, input features are:
+      [e_j0(t)..e_j0(t-N*s), v_j0(t)..v_j0(t-N*s), e_j1(...)..., v_j1(...)...]
+    giving in_dim = 2 * n * (num_samples_in_history + 1).
+    Output ys shape: (T, n).
+    """
+    H = num_samples_in_history + 1  # include current timestep
+    s = history_stride
+    xs_parts = []
+    if model_type =="mlp":
+        for i in joint_indices:
+            for t in range(H - 1, -1, -1):
+                start = t * s
+                end   = -(H - 1 - t) * s if (H - 1 - t) * s != 0 else None
+                xs_parts.append(joint_position_errors[start:end, i:i+1])
+            for t in range(H - 1, -1, -1):
+                start = t * s
+                end   = -(H - 1 - t) * s if (H - 1 - t) * s != 0 else None
+                xs_parts.append(joint_velocities[start:end, i:i+1])
+        xs = torch.cat(xs_parts, dim=1)
+    else:
+        for i in joint_indices:
+            xs_parts.append(joint_position_errors[:, i:i+1])
+            xs_parts.append(joint_velocities[:, i:i+1])
+        raw = torch.cat(xs_parts, dim=1)  # (T, 2*num_joints)
+        # Build strided sliding-window sequences matching MLP convention:
+        # each window has H steps spaced s apart, covering (H-1)*s+1 raw frames.
+        T = raw.shape[0]
+        window_span = (H - 1) * s + 1
+        N = T - window_span + 1
+        window_idx = torch.arange(H) * s                       # (H,)
+        start_idx  = torch.arange(N).unsqueeze(1)              # (N, 1)
+        idx = start_idx + window_idx.unsqueeze(0)              # (N, H)
+        xs = raw[idx]                                          # (N, H, 2*num_joints)
+        ys = tau_ests[(H - 1) * s:, joint_indices][:N]        # (N, num_joints)
+        return xs, ys
+
 def train_actuator_network_and_plot_predictions(experiment_dir, actuator_network_path, dataloader_path, model_type, load_pretrained_model=False):
-    hyperparam_sweep = True
-    joint_position_errors, joint_velocities, tau_ests, num_actuators = load_experiments(experiment_dir,
-                                                                                                                              torque_scaling=.01,
-                                                                                                                              torque_cliping=[-2, 2])
+    hyperparam_sweep = False
+    best_params_path = os.path.join(os.path.dirname(actuator_network_path) or ".", "best_params.json")
+    all_pkl_files = [f for f in sorted(glob(f"{experiment_dir}/*.pkl"))
+                     if os.path.basename(f) != EVAL_PKL_NAME]
     num_samples_in_history = 2
-    train_xs, train_ys = prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, num_actuators, num_samples_in_history)
 
     if load_pretrained_model:
-        model = torch.jit.load(actuator_network_path).to('cpu')
-        train_loader, test_loader = load_dataloaders(dataloader_path) # test still test
+        with open(best_params_path) as f:
+            saved_best = json.load(f)
+        print(f"Loaded best hyperparams from {best_params_path}")
     else:
+        saved_best = {}
         if hyperparam_sweep:
             param_grid = {
                 'batch_size': [64],
-                'units': [32, 48, 64],#32, 48
-                'layers': [2, 3, 4],
+                'units': [32],
+                'layers': [2],
                 'lr': [8e-4, 8e-3, 1e-4],
-                'eps': [1e-8],  # Values for the optimizer's epsilon
-                'weight_decay': [0.0,   1e-8],  # Regularization term
-                'num_samples_in_history': [2, 3, 4, 5, 6],  # Number of past samples to consider
-                'epochs': [200]  # Reduced for quick experiments
+                'eps': [1e-8],
+                'weight_decay': [0.0, 1e-8],
+                'num_samples_in_history': [2],
+                'epochs': [200]
             }
-            # param_grid = {
-            #     'batch_size': [128],
-            #     'units': [32],#32, 48
-            #     'layers': [2, 3,],
-            #     'lr': [8e-4],
-            #     'eps': [1e-8],  # Values for the optimizer's epsilon
-            #     'weight_decay': [0.0],  # Regularization term
-            #     'num_samples_in_history': [2],  # Number of past samples to consider
-            #     'epochs': [100]  # Reduced for quick experiments
-            # }
 
-            grid = ParameterGrid(param_grid)
-            results = []
-            for params in tqdm(grid):
-                try:
-                    print(f"Attempting to train with hyperparameters: {params}")
-                    #Configure and train the model with current set of hyperparameters
-                    train_xs, train_ys = prepare_data_for_model(joint_position_errors, joint_velocities, tau_ests, num_actuators, 
-                                                                params['num_samples_in_history'])
-                    (model, test_loss, test_mae) = train_actuator_network(train_xs, train_ys,
-                                                batch_size=params['batch_size'],
-                                                num_samples_in_history=params['num_samples_in_history'],
-                                                units=params['units'],
-                                                layers=params['layers'],
-                                                lr=params['lr'],
-                                                epochs=params['epochs'],
-                                                eps=params['eps'],
-                                                weight_decay=params['weight_decay'],
-                                                actuator_network_path=actuator_network_path,
-                                                dataloader_path=dataloader_path,
-                                                model_type=model_type,
-                                                return_stats=True)
-                    
-                    #Load the test set and evaluate the model
-                    _, test_loader = load_dataloaders(dataloader_path)
-                    
-                    # Append results
-                    results.append((params, (float(test_loss), float(test_mae))))
-                except Exception as e:
-                    results.append((params, (float('inf'), float('inf'))))
-                    print(f"Failed with hyperparameters: {params}")
-                    print(e)
-                    continue
-            print(results)
-            np.save("results.npy", np.array(results))
-            best_params = min(results, key=lambda x: x[1][0])  # assuming test_loss is the first element in the tuple
-            print(f"Best params based on test loss: {best_params[0]} with loss: {best_params[1][0]} and MAE: {best_params[1][1]}")
+            jpe_all, jv_all, te_all, _ = load_experiments(experiment_dir,
+                                                           torque_scaling=.01,
+                                                           exclude={EVAL_PKL_NAME})
+            for joint_indices, group_name in JOINT_GROUPS:
+                num_joints = len(joint_indices)
+                print(f"\n{'='*60}\nSweep: {group_name}\n{'='*60}")
+                sweep_net_path = actuator_network_path.replace(".pt", f"_{group_name}_sweep_temp.pt")
+                sweep_dl_path  = dataloader_path.replace(".dataloader", f"_{group_name}_sweep_temp.dataloader")
+                results = []
+                for params in tqdm(ParameterGrid(param_grid)):
+                    try:
+                        print(f"Attempting to train with hyperparameters: {params}")
+                        train_xs, train_ys = prepare_data_for_joint_group(
+                            jpe_all, jv_all, te_all, joint_indices, params['num_samples_in_history'], model_type=model_type)
+                        (_, test_loss, test_mae) = train_actuator_network(
+                            train_xs, train_ys,
+                            batch_size=params['batch_size'],
+                            num_samples_in_history=params['num_samples_in_history'], 
+                            units=params['units'], layers=params['layers'],
+                            lr=params['lr'], epochs=params['epochs'],
+                            eps=params['eps'], weight_decay=params['weight_decay'],
+                            actuator_network_path=sweep_net_path,
+                            dataloader_path=sweep_dl_path,
+                            model_type=model_type, num_joints=num_joints,
+                            return_stats=True)
+                        results.append((params, (float(test_loss), float(test_mae))))
+                    except Exception as e:
+                        results.append((params, (float('inf'), float('inf'))))
+                        print(f"Failed with hyperparameters: {params}")
+                        print(e)
+                        continue
+                for p in [sweep_net_path, sweep_dl_path]:
+                    if os.path.exists(p):
+                        os.remove(p)
+                np.save(f"results_{group_name}.npy", np.array(results, dtype=object))
+                best_params = min(results, key=lambda x: x[1][0])
+                print(f"Best params based on test loss: {best_params[0]} with loss: {best_params[1][0]} and MAE: {best_params[1][1]}")
+                saved_best[group_name] = best_params[0]
+
+            with open(best_params_path, 'w') as f:
+                json.dump(saved_best, f, indent=2)
+            print(f"Saved best params → {best_params_path}")
         else:
-            model = train_actuator_network(train_xs, train_ys, batch_size=64,
-                                        num_samples_in_history=num_samples_in_history, 
-                                        units=32, layers=3, lr=8e-4, epochs=200, eps=1e-8, 
-                                        weight_decay=0.0,
-                                        actuator_network_path=actuator_network_path, 
-                                        dataloader_path=dataloader_path,
-                                        model_type=model_type).to("cpu")
-            
-            train_loader, test_loader = load_dataloaders(dataloader_path) # test still test after running eval.py
-    
-    if not hyperparam_sweep:
-        # Predict and plot only for validation set
-        val_xs = []
-        val_ys = []
-        
-        num_samples = 200  # Change this to the desired number of samples
-        for batch in test_loader:
-            data = batch['joint_states']
-            target = batch['tau_ests']
-            val_xs.append(data)
-            val_ys.append(target)
-            if len(val_xs) >= num_samples:
-                break
-        val_xs = torch.cat(val_xs)[:num_samples]
-        val_ys = torch.cat(val_ys)[:num_samples]
-        if model_type == 'lstm':
-            val_xs = val_xs.view(val_xs.size(0), val_xs.size(1), 1) 
-        tau_preds = model(val_xs).detach().reshape(num_actuators, -1).T
+            fixed_params = dict(batch_size=64, num_samples_in_history=2,
+                                units=32, layers=3, lr=8e-4, epochs=200,
+                                eps=1e-8, weight_decay=0.0)
+            for _, group_name in JOINT_GROUPS:
+                saved_best[group_name] = fixed_params
 
-        timesteps = np.linspace(0, 1, int(num_samples/2))
-        tau_ests = val_ys.reshape(num_actuators, -1).T
-    
-        fig, axs = plt.subplots(1, num_actuators, figsize=(14, 6))
-        axs = np.array(axs).flatten()
-        print(timesteps.shape)
-        print(tau_preds.shape)
-        print(tau_ests.shape)
-        for i in range(num_actuators):
-            axs[i].plot(timesteps, tau_ests[:, i], label="Measured Torque (Y)", color="green", linewidth=.5)
-            axs[i].plot(timesteps, tau_preds[:, i], label="Predicted Torque (Y_hat)", color="red", linewidth=.5)
-            axs[i].legend()
+        # Sequential training: pkl outer loop, group inner loop
+        FINETUNE_EPOCH_RATIO = 0.5
 
-        plt.show()
+        # Clear any leftover checkpoints so first pkl always starts from scratch
+        for _, group_name in JOINT_GROUPS:
+            group_net_path = actuator_network_path.replace(".pt", f"_{group_name}.pt")
+            if os.path.exists(group_net_path):
+                os.remove(group_net_path)
+
+        group_epoch_offset = {group_name: 0 for _, group_name in JOINT_GROUPS}
+
+        for pkl_idx, pkl_path in tqdm(enumerate(all_pkl_files), total=len(all_pkl_files), desc="PKL files"):
+            print(f"\n{'='*60}\nPKL {pkl_idx+1}/{len(all_pkl_files)}: {os.path.basename(pkl_path)}\n{'='*60}")
+            for joint_indices, group_name in tqdm(JOINT_GROUPS, desc="Joint groups", leave=False):
+                params = saved_best.get(group_name)
+                if params is None:
+                    continue
+
+                num_joints       = len(joint_indices)
+                group_net_path   = actuator_network_path.replace(".pt", f"_{group_name}.pt")
+                group_dl_path    = dataloader_path.replace(".dataloader", f"_{group_name}.dataloader")
+                fine_tune_epochs = max(20, int(params['epochs'] * FINETUNE_EPOCH_RATIO))
+                group_log_dir    = f'./logs/{group_name}'
+
+                jpe, jv, te = load_single_experiment(pkl_path, torque_scaling=.01)
+                train_xs, train_ys = prepare_data_for_joint_group(
+                    jpe, jv, te, joint_indices, params['num_samples_in_history'], model_type=model_type)
+
+                pretrained = group_net_path if os.path.exists(group_net_path) else None
+                train_actuator_network(
+                    train_xs, train_ys,
+                    batch_size=params['batch_size'],
+                    num_samples_in_history=params['num_samples_in_history'],
+                    units=params['units'], layers=params['layers'],
+                    lr=params['lr'], epochs=fine_tune_epochs,
+                    eps=params['eps'], weight_decay=params['weight_decay'],
+                    actuator_network_path=group_net_path,
+                    dataloader_path=group_dl_path,
+                    model_type=model_type, num_joints=num_joints,
+                    pretrained_model_path=pretrained,
+                    global_step_offset=group_epoch_offset[group_name],
+                    log_dir=group_log_dir)
+
+                group_epoch_offset[group_name] += fine_tune_epochs
+
+    print("\nAll groups done.")
+    return saved_best
