@@ -126,8 +126,8 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
 
     dataset = ActuatorDataset({"joint_states": xs, "tau_ests": ys})
     train_set, val_set = random_split(dataset, [num_train, num_test])
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(val_set, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     if save_dataloaders_flag:
         save_dataloaders(train_loader, test_loader, dataloader_path)
@@ -177,7 +177,6 @@ def train_actuator_network(xs, ys, batch_size, num_samples_in_history, units, la
         for batch in train_loader:
             data = batch['joint_states'].to(device)
             if model_type == 'lstm':
-                # data: (batch, seq_len, 2*num_joints) – already windowed
                 y_pred, _ = model(data)
             else:
                 y_pred = model(data)
@@ -380,17 +379,8 @@ def prepare_data_for_joint_group(joint_position_errors, joint_velocities, tau_es
         for i in joint_indices:
             xs_parts.append(joint_position_errors[:, i:i+1])
             xs_parts.append(joint_velocities[:, i:i+1])
-        raw = torch.cat(xs_parts, dim=1)  # (T, 2*num_joints)
-        # Build strided sliding-window sequences matching MLP convention:
-        # each window has H steps spaced s apart, covering (H-1)*s+1 raw frames.
-        T = raw.shape[0]
-        window_span = (H - 1) * s + 1
-        N = T - window_span + 1
-        window_idx = torch.arange(H) * s                       # (H,)
-        start_idx  = torch.arange(N).unsqueeze(1)              # (N, 1)
-        idx = start_idx + window_idx.unsqueeze(0)              # (N, H)
-        xs = raw[idx]                                          # (N, H, 2*num_joints)
-        ys = tau_ests[(H - 1) * s:, joint_indices][:N]        # (N, num_joints)
+        xs = torch.cat(xs_parts, dim=1).unsqueeze(1)
+        ys = tau_ests[:, joint_indices]         # (N, num_joints)
         return xs, ys
 
 def train_actuator_network_and_plot_predictions(experiment_dir, actuator_network_path, dataloader_path, model_type, load_pretrained_model=False):
