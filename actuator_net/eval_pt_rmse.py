@@ -12,8 +12,8 @@ import torch
 from utils import JOINT_GROUPS, load_single_experiment
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EXPERIMENT_DIR = '/home/dyros/scraps/actuator_net/data/pkl'
-MODEL_DIR      = '/home/dyros/scraps/actuator_net'
+EXPERIMENT_DIR = '/home/user/actuatornet/actuator_net/data/pkl'
+MODEL_DIR      = '/home/user/actuatornet/actuator_net'
 
 # Choose a pkl file that was NOT used during training.
 # Disturbance datasets are new and were never included in training.
@@ -68,9 +68,8 @@ for idx, (joint_indices, group_name) in enumerate(JOINT_GROUPS):
     y_true_Nm = y_true_scaled / TORQUE_SCALE
 
     rmse = float(torch.sqrt(((y_pred_Nm - y_true_Nm) ** 2).mean()))
-    mae  = float((y_pred_Nm - y_true_Nm).abs().mean())
-    print(f"[{group_name:22s}]  RMSE={rmse:.4f} Nm  MAE={mae:.4f} Nm")
-    results[group_name] = {"rmse": rmse, "mae": mae}
+    print(f"RMSE={rmse:.4f} Nm")
+    results[group_name] = {"rmse": rmse}
 
     t_axis = np.arange(N) * 0.001  # 1 kHz → seconds
     ax.plot(t_axis, y_true_Nm.numpy(), label="Measured",   color="green", linewidth=1.5)
@@ -95,7 +94,7 @@ print(f"\nSaved plot: {out_path}")
 
 print("\n─── RMSE Summary ───────────────────────────────────────────")
 for name, r in results.items():
-    print(f"  {name:22s}  RMSE={r['rmse']:.4f} Nm  MAE={r['mae']:.4f} Nm")
+    print(f"  {name:22s}  RMSE={r['rmse']:.4f} Nm")
 
 if results:
     avg_rmse = np.mean([r["rmse"] for r in results.values()])

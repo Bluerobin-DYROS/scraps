@@ -11,8 +11,8 @@ import torch
 from utils import JOINT_GROUPS, load_single_experiment
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-EXPERIMENT_DIR = '/home/dyros/scraps/actuator_net/data/pkl'
-MODEL_DIR      = '/home/dyros/scraps/actuator_net'
+EXPERIMENT_DIR = '/home/user/actuatornet/actuator_net/data/pkl'
+MODEL_DIR      = '/home/user/actuatornet/actuator_net'
 EVAL_PKL_NAME  = 'data_chirp_amplitude0.3_f00.1_f10.5_disturbance.pkl'
 TORQUE_SCALE   = 0.01
 TARGET_JOINT   = 'right_ankle_pitch'
@@ -69,9 +69,8 @@ print(f"Peak at {peak_time:.3f} s  (|τ| = {np.abs(yt_ov[peak_idx]):.2f} Nm)")
 t_pk, yt_pk, yp_pk = time_slice(t_np, y_true_Nm, y_pred_Nm, PEAK_START, PEAK_END)
 
 rmse = np.sqrt(np.mean((yp_ov - yt_ov) ** 2))
-mae  = np.mean(np.abs(yp_ov - yt_ov))
 plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif']  = ['Times New Roman']
+plt.rcParams['font.serif']  = ['Liberation Serif', 'DejaVu Serif', 'Times New Roman']
 plt.rcParams['mathtext.fontset'] = 'stix'
 # ─── Figure (tight_layout 먼저, ConnectionPatch 나중) ────────────────────────
 fig, (ax1, ax2) = plt.subplots(
@@ -84,7 +83,7 @@ ax1.plot(t_ov, yt_ov, label='Measured', color='#2ca02c', linewidth=LINE_MEASURED
 ax1.plot(t_ov, yp_ov, label='Predicted', color='#d62728',
          linewidth=LINE_PRED, linestyle='--')
 ax1.set_title(
-    f"Right Ankle Pitch  (RMSE = {rmse:.2f} Nm,  MAE = {mae:.2f} Nm)",
+    f"Right Ankle Pitch  (RMSE = {rmse:.3f} Nm)",
     fontsize=FONT_TITLE, fontweight='bold',
 )
 ax1.set_ylabel('Torque [Nm]', fontsize=FONT_LABEL)
@@ -148,7 +147,7 @@ plt.savefig(out_path, dpi=300, bbox_inches='tight')
 plt.close()
 
 print(f"Saved → {out_path}")
-print(f"  RMSE = {rmse:.4f} Nm,  MAE = {mae:.4f} Nm")
+print(f"  RMSE = {rmse:.4f} Nm")
 
 # ─── Peak torque 상세 출력 ───────────────────────────────────────────────────
 peak_measured = yt_ov[peak_idx]
